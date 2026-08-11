@@ -20,8 +20,7 @@ def show_modulo_pedidos():
     # ---------------------------------------------------------
     with st.expander("📂 VER PEDIDOS / ENCARGOS PENDIENTES", expanded=False):
         try:
-            # Consulta de pedidos pendientes y clientes por separado para evitar fallos de JOIN
-            res_p = supabase.table("pedidos").select("*").neq("estado", "Finalizado").order("fecha_entrega").execute()
+            res_p = supabase.table("pedidos").select("*").neq("estado", "Entregado").order("fecha_entrega").execute()
             res_c_all = supabase.table("clientes").select("id, nombre").execute()
             
             pedidos_list = res_p.data or []
@@ -31,7 +30,6 @@ def show_modulo_pedidos():
                 df_pend = pd.DataFrame(pedidos_list)
                 df_pend["cliente"] = df_pend["cliente_id"].map(dict_map_clientes).fillna("N/A")
                 
-                # Asegurar columnas opcionales si vienen nulas
                 for col in ["forma_entrega", "monto_sena", "notas_personalizacion"]:
                     if col not in df_pend.columns:
                         df_pend[col] = "-"
@@ -81,7 +79,6 @@ def show_modulo_pedidos():
         c_cli.warning("No hay clientes registrados en el sistema.")
         cliente_actual = None
 
-    # Modal para dar de alta clientes rápidamente
     with c_btn_cli:
         st.write("") 
         if st.button("➕", help="Crear Nuevo Cliente"):
@@ -132,26 +129,30 @@ def show_modulo_pedidos():
     if "carrito_pos" not in st.session_state:
         st.session_state.carrito_pos = []
 
-    prod_sel_key = st.selectbox(
-        "Buscar por nombre en el catálogo",
-        options=["Escriba para buscar producto..."] + list(dict_productos.keys())
-    )
+    def agregar_producto_al_carrito():
+        prod_sel_key = st.session_state.get("selector_producto_pos")
+        if prod_sel_key and prod_sel_key != "Escriba para buscar producto...":
+            if prod_sel_key in dict_productos:
+                prod_obj = dict_productos[prod_sel_key]
+                
+                existe = next((item for item in st.session_state.carrito_pos if item["id"] == prod_obj["id"]), None)
+                if existe:
+                    existe["cantidad"] += 1
+                else:
+                    st.session_state.carrito_pos.append({
+                        "id": prod_obj["id"],
+                        "nombre": prod_obj["nombre"],
+                        "precio": float(prod_obj["precio_venta"]),
+                        "cantidad": 1
+                    })
+            st.session_state["selector_producto_pos"] = "Escriba para buscar producto..."
 
-    if prod_sel_key != "Escriba para buscar producto...":
-        prod_obj = dict_productos[prod_sel_key]
-        
-        # Verificar si ya existe en el carrito
-        existe = next((item for item in st.session_state.carrito_pos if item["id"] == prod_obj["id"]), None)
-        if existe:
-            existe["cantidad"] += 1
-        else:
-            st.session_state.carrito_pos.append({
-                "id": prod_obj["id"],
-                "nombre": prod_obj["nombre"],
-                "precio": float(prod_obj["precio_venta"]),
-                "cantidad": 1
-            })
-        st.rerun()
+    st.selectbox(
+        "Buscar por nombre en el catálogo",
+        options=["Escriba para buscar producto..."] + list(dict_productos.keys()),
+        key="selector_producto_pos",
+        on_change=agregar_producto_al_carrito
+    )
 
     # ---------------------------------------------------------
     # 3. DETALLE DE LA VENTA / TABLA INTERACTIVA
@@ -232,6 +233,7 @@ def show_modulo_pedidos():
             st.error("Por favor selecciona un cliente antes de guardar.")
         else:
             try:
+                # 1. Crear el registro en la tabla pedidos
                 payload_p = {
                     "cliente_id": cliente_actual["id"],
                     "vendedor": vendedor,
@@ -242,21 +244,31 @@ def show_modulo_pedidos():
                     "fecha_pedido": datetime.now().isoformat(),
                     "fecha_entrega": str(fecha_entrega),
                     "notas_personalizacion": observaciones,
-                    "estado": "Finalizado"
+                    "estado": "Entregado"
                 }
                 res_p = supabase.table("pedidos").insert(payload_p).execute()
                 pedido_id = res_p.data[0]["id"]
 
+                detalles_payload = []
                 for item in st.session_state.carrito_pos:
-                    supabase.table("pedido_detalles").insert({
+                    # NOTA: Se omite 'subtotal' porque la columna se genera automáticamente en Supabase
+                    detalles_payload.append({
                         "pedido_id": pedido_id,
                         "producto_id": item["id"],
                         "cantidad": int(item["cantidad"]),
-                        "precio_unitario": item["precio"],
-                        "subtotal": item["cantidad"] * item["precio"]
-                    }).execute()
+                        "precio_unitario": float(item["precio"])
+                    })
+                    
+                    # 2. DESCONTAR STOCK VÍA RPC
+                    supabase.rpc(
+                        "descontar_stock", 
+                        {"pid": int(item["id"]), "cant": int(item["cantidad"])}
+                    ).execute()
 
-                st.success("🎉 ¡Venta finalizada y registrada correctamente!")
+                # 3. Guardar detalles sin la columna 'subtotal'
+                supabase.table("pedido_detalles").insert(detalles_payload).execute()
+
+                st.success("🎉 ¡Venta finalizada, registrada y stock actualizado correctamente!")
                 st.session_state.carrito_pos = []
                 st.rerun()
             except Exception as e:
@@ -283,14 +295,18 @@ def show_modulo_pedidos():
                 res_p = supabase.table("pedidos").insert(payload_p).execute()
                 pedido_id = res_p.data[0]["id"]
 
-                for item in st.session_state.carrito_pos:
-                    supabase.table("pedido_detalles").insert({
+                # Omitimos 'subtotal' en el insert
+                detalles_payload = [
+                    {
                         "pedido_id": pedido_id,
                         "producto_id": item["id"],
                         "cantidad": int(item["cantidad"]),
-                        "precio_unitario": item["precio"],
-                        "subtotal": item["cantidad"] * item["precio"]
-                    }).execute()
+                        "precio_unitario": float(item["precio"])
+                    }
+                    for item in st.session_state.carrito_pos
+                ]
+                
+                supabase.table("pedido_detalles").insert(detalles_payload).execute()
 
                 st.success("🎉 ¡Encargo guardado como PENDIENTE! Puedes verlo en la lista superior.")
                 st.session_state.carrito_pos = []
