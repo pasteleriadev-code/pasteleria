@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from utils import get_supabase_client
+# 1. Importamos RUBROS_INSUMOS desde utils
+from utils import get_supabase_client, RUBROS_INSUMOS
 
 supabase = get_supabase_client()
 
@@ -10,7 +11,7 @@ def normalizar_unidad(u: str) -> str:
     if not u:
         return ""
     u_clean = u.lower().strip()
-    if u_clean in ["kg", "kilo", "kilogramo", "kilogramos", "kgs"]:
+    if u_clean in ["kg", "kilo", "kilogramo", "kilogramos", "kgs", "kilos"]:
         return "kg"
     if u_clean in ["g", "gramo", "gramos", "gr", "grs"]:
         return "g"
@@ -103,7 +104,8 @@ def show_modulo_proveedores():
             )
 
             direccion = st.text_input("Dirección")
-            rubros = st.text_input("Asociar Rubros", placeholder="Ej. Lácteos, Harinas, Empaques")
+            # Usamos multiselect basado en RUBROS_INSUMOS
+            rubros_sel = st.multiselect("Asociar Rubros", options=RUBROS_INSUMOS)
 
             submitted = st.form_submit_button("Guardar Proveedor", use_container_width=True)
 
@@ -117,7 +119,7 @@ def show_modulo_proveedores():
                         "telefono": telefono.strip(),
                         "condicion_fiscal": condicion_fiscal,
                         "direccion": direccion.strip(),
-                        "rubros": rubros.strip()
+                        "rubros": ", ".join(rubros_sel)  # Guardamos como string separado por comas
                     }
                     try:
                         supabase.table("proveedores").insert(nuevo_prov).execute()
@@ -155,7 +157,11 @@ def show_modulo_proveedores():
                     edit_cf = col4.selectbox("Condición Fiscal", opciones_cf, index=idx_cf)
 
                     edit_dir = st.text_input("Dirección", value=datos_actuales.get("direccion", ""))
-                    edit_rubros = st.text_input("Rubros", value=datos_actuales.get("rubros", ""))
+                    
+                    # Cargar rubros previamente seleccionados si existen
+                    rubros_previos_str = datos_actuales.get("rubros", "") or ""
+                    rubros_previos_list = [r.strip() for r in rubros_previos_str.split(",") if r.strip() in RUBROS_INSUMOS]
+                    edit_rubros = st.multiselect("Rubros", options=RUBROS_INSUMOS, default=rubros_previos_list)
 
                     if st.form_submit_button("Actualizar Cambios", use_container_width=True):
                         update_data = {
@@ -164,7 +170,7 @@ def show_modulo_proveedores():
                             "telefono": edit_tel.strip(),
                             "condicion_fiscal": edit_cf,
                             "direccion": edit_dir.strip(),
-                            "rubros": edit_rubros.strip()
+                            "rubros": ", ".join(edit_rubros)
                         }
                         supabase.table("proveedores").update(update_data).eq("id", datos_actuales["id"]).execute()
                         st.success("¡Datos actualizados correctamente!")
@@ -226,22 +232,66 @@ def show_modulo_proveedores():
         fecha_fac = st.date_input("Fecha de Factura", value=datetime.today())
 
         st.markdown("---")
-        st.subheader("🔍 Añadir Insumo a la Compra (con Conversión de Unidades)")
+        st.subheader("🔍 Añadir Insumo a la Compra")
 
         res_ins = supabase.table("insumos").select("*").order("nombre").execute()
-        insumos = res_ins.data
-
-        if not insumos:
-            st.warning("⚠️ No hay insumos registrados en el inventario. Agrega insumos primero.")
-            return
+        insumos = res_ins.data or []
 
         dict_insumos = {i["nombre"]: i for i in insumos}
 
         if "carrito_compra" not in st.session_state:
             st.session_state.carrito_compra = []
 
-        # Seleccionar el Insumo
-        ins_sel_nombre = st.selectbox("Escriba para buscar producto/insumo...", list(dict_insumos.keys()))
+        # ---------------------------------------------------------
+        # SELECTBOX + BOTÓN "+" EN LA MISMA LÍNEA
+        # ---------------------------------------------------------
+        col_select, col_btn_nuevo = st.columns([8.5, 1.5], vertical_alignment="bottom")
+
+        with col_select:
+            if dict_insumos:
+                ins_sel_nombre = st.selectbox("Escriba para buscar producto/insumo...", list(dict_insumos.keys()))
+            else:
+                ins_sel_nombre = st.selectbox("Escriba para buscar producto/insumo...", ["(Sin insumos cargados)"])
+
+        with col_btn_nuevo:
+            with st.popover("➕", use_container_width=True, help="Crear nuevo insumo rápido"):
+                st.subheader("🆕 Crear Nuevo Insumo")
+                with st.form("form_rapido_insumo", clear_on_submit=True):
+                    quick_nombre = st.text_input("Nombre del Insumo *", placeholder="Ej. Harina 0000")
+                    # Aquí RUBROS_INSUMOS viene directamente del import de utils
+                    quick_rubro = st.selectbox("Categoría / Rubro *", RUBROS_INSUMOS)
+                    quick_unidad = st.selectbox("Unidad Base *", ["gramos", "mililitros", "unidades", "kilos", "litros"])
+                    
+                    c_q1, c_q2 = st.columns(2)
+                    quick_stock_min = c_q1.number_input("Stock Mínimo", min_value=0.0, value=0.0, step=10.0)
+                    quick_costo_init = c_q2.number_input("Costo Unit. Inicial ($)", min_value=0.0, value=0.0, step=0.001, format="%.4f")
+
+                    btn_crear_quick = st.form_submit_button("💾 Crear Insumo", type="primary", use_container_width=True)
+
+                    if btn_crear_quick:
+                        if not quick_nombre.strip():
+                            st.error("El nombre es obligatorio.")
+                        else:
+                            try:
+                                nuevo_ins_data = {
+                                    "nombre": quick_nombre.strip(),
+                                    "rubro": quick_rubro,
+                                    "unidad_medida": quick_unidad,
+                                    "stock_actual": 0.0,
+                                    "stock_minimo": quick_stock_min,
+                                    "costo_unidad": quick_costo_init
+                                }
+                                supabase.table("insumos").insert(nuevo_ins_data).execute()
+                                st.success(f"Insumo '{quick_nombre}' creado con éxito.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error al crear insumo: {e}")
+
+        # Si no hay insumos cargados, detenemos la ejecución de la adición de items
+        if not dict_insumos:
+            st.warning("⚠️ No hay insumos en el catálogo. Haz clic en '➕' arriba para registrar el primero.")
+            return
+
         ins_objeto = dict_insumos[ins_sel_nombre]
         unidad_base = ins_objeto.get("unidad_medida", "unidades")
 
@@ -312,7 +362,7 @@ def show_modulo_proveedores():
             st.markdown("### 🛒 Detalle de la Compra a Registrar")
             df_carrito = pd.DataFrame(st.session_state.carrito_compra)
             
-            # Formateo visual defensivo con .get() por si existen items de la versión anterior
+            # Formateo visual defensivo
             df_carrito["factura_detalle"] = df_carrito.apply(
                 lambda r: f"{r.get('cant_factura', r.get('cantidad', 0))} {r.get('unidad_factura', r.get('unidad', ''))}", 
                 axis=1
@@ -361,11 +411,9 @@ def show_modulo_proveedores():
                     compra_id = compra_res.data[0]["id"]
 
                     for item in st.session_state.carrito_compra:
-                        # Extraer datos con compatibilidad para ambas versiones
                         cant_a_ingresar = item.get("cant_base", item.get("cantidad", 0))
                         costo_a_ingresar = item.get("costo_unitario_base", item.get("precio_unitario", 0))
 
-                        # Registro en el detalle de compras en unidades base
                         detalle_payload = {
                             "compra_id": compra_id,
                             "insumo_id": item["insumo_id"],
@@ -374,7 +422,6 @@ def show_modulo_proveedores():
                         }
                         supabase.table("compra_detalles").insert(detalle_payload).execute()
 
-                        # Actualización de stock y costo del insumo
                         ins_id = item["insumo_id"]
                         ins_actual = supabase.table("insumos").select("stock_actual").eq("id", ins_id).single().execute().data
                         stock_previo = float(ins_actual.get("stock_actual", 0.0))
